@@ -31,7 +31,7 @@ interface ProcessingQueueProps {
   setSelected: (ids: (string | number)[]) => void;
   onBulkDelete?: () => Promise<void>;
   bulkDeleteLoading?: boolean;
-  jobProgress?: Record<string, { progress: number; fps: number; currentFile: any; updated: number }>;
+  totalJobs: number;
 }
 
 export default function ProcessingQueue({
@@ -45,14 +45,34 @@ export default function ProcessingQueue({
   setSelected,
   onBulkDelete,
   bulkDeleteLoading,
-  jobProgress = {},
+  totalJobs,
 }: ProcessingQueueProps) {
   const [filter, setFilter] = useState<string>('all');
   const [selectAllLoading, setSelectAllLoading] = useState(false);
-  const [allJobIds, setAllJobIds] = useState<(string | number)[]>([]);
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [jobsPerPage] = useState<number>(50);
+
   const jobsWithId = jobs.filter((job) => job.id !== undefined && job.id !== null);
-  console.log('Job IDs in queue:', jobsWithId.map((j) => j.id));
+  // Comment out noisy logging
+  // console.log('Job IDs in queue:', jobsWithId.map((j) => j.id));
   const filteredJobs = jobsWithId.filter((job) => filter === 'all' || job.status === filter);
+
+  // Pagination
+  const totalPages = Math.ceil(filteredJobs.length / jobsPerPage);
+  const startIndex = (currentPage - 1) * jobsPerPage;
+  const endIndex = startIndex + jobsPerPage;
+  const currentJobs = filteredJobs.slice(startIndex, endIndex);
+
+  // Track if select all is active (backend-driven)
+  const [selectAllActive, setSelectAllActive] = useState(false);
+
+  // Use totalJobs for select all label
+  const totalJobsFromBackend = totalJobs || filteredJobs.length;
+  // If jobs are paginated, pass total from parent as a prop for accuracy
+
+  // Select all logic
+  const allSelected = selectAllActive;
+
   const [cpuLimit, setCpuLimit] = useState<number>(2);
   const [gpuLimit, setGpuLimit] = useState<number>(1);
   const [cpuPaused, setCpuPaused] = useState(false);
@@ -60,25 +80,6 @@ export default function ProcessingQueue({
   const [prevCpuLimit, setPrevCpuLimit] = useState<number>(2);
   const [prevGpuLimit, setPrevGpuLimit] = useState<number>(1);
   const [workerSaving, setWorkerSaving] = useState<'idle' | 'saving' | 'saved'>('idle');
-
-  // Fetch all job IDs for the current filter
-  useEffect(() => {
-    const fetchAllJobIds = async () => {
-      setSelectAllLoading(true);
-      try {
-        const ids = await ProcessingJobEntity.getAllIds(filter === 'all' ? undefined : filter);
-        setAllJobIds(ids);
-      } catch (error) {
-        console.error('Error fetching all job IDs:', error);
-        // Fallback to using filtered jobs
-        setAllJobIds(filteredJobs.map((job) => job.id!));
-      } finally {
-        setSelectAllLoading(false);
-      }
-    };
-
-    fetchAllJobIds();
-  }, [filter, jobs]);
 
   // Fetch worker limits on mount
   useEffect(() => {
@@ -123,13 +124,14 @@ export default function ProcessingQueue({
     failed: { color: 'bg-red-100 text-red-700', icon: AlertTriangle },
   };
 
-  // Selection logic - now based on allJobIds instead of filteredJobs
-  const allSelected = allJobIds.length > 0 && selected.length === allJobIds.length;
-  const handleSelectAll = async () => {
-    if (allSelected) {
+  // Handle select all for ALL jobs (backend-driven)
+  const handleSelectAll = () => {
+    if (selectAllActive) {
+      setSelectAllActive(false);
       setSelected([]);
     } else {
-      setSelected([...allJobIds.filter((id) => id !== undefined && id !== null)]);
+      setSelectAllActive(true);
+      setSelected([]); // Don't try to select all IDs in frontend
     }
   };
 
@@ -174,6 +176,19 @@ export default function ProcessingQueue({
     }
   };
 
+  // Bulk delete handler
+  const handleBulkDelete = async () => {
+    if (selectAllActive) {
+      await ProcessingJobEntity.bulkDelete({ all: true, filter: filter !== 'all' ? { status: filter } : undefined });
+      setSelectAllActive(false);
+      setSelected([]);
+    } else {
+      await ProcessingJobEntity.bulkDelete({ jobIds: selected });
+      setSelected([]);
+    }
+    // Optionally, reload jobs after delete
+  };
+
   return (
     <Card className="border-0 rounded-2xl shadow-lg bg-slate-800/90 backdrop-blur-md flex flex-col min-h-0">
       <CardHeader>
@@ -197,16 +212,16 @@ export default function ProcessingQueue({
                 <span className="text-xs text-blue-400 animate-pulse ml-1">Loading all…</span>
               )}
               <label htmlFor="select-all-jobs" className="text-slate-200 text-xs">
-                Select all
+                Select all ({totalJobsFromBackend})
               </label>
             </div>
-            {selected.length > 0 && onBulkDelete && (
+            {(selected.length > 0 || selectAllActive) && onBulkDelete && (
               <div className="flex items-center gap-2 ml-4">
                 <span className="text-xs text-slate-300">
-                  {selected.length} selected
+                  {allSelected ? totalJobsFromBackend : selected.length} selected
                 </span>
                 <Button
-                  onClick={onBulkDelete}
+                  onClick={handleBulkDelete}
                   size="sm"
                   variant="destructive"
                   className="h-7 px-3 text-xs bg-red-500/90 hover:bg-red-500 text-white rounded-lg disabled:opacity-60 disabled:cursor-not-allowed"
@@ -326,7 +341,7 @@ export default function ProcessingQueue({
           </div>
         ) : (
           <AnimatePresence>
-            {filteredJobs.map((job) => {
+            {currentJobs.map((job) => {
               const mediaFile = getMediaFile(job.media_file_id);
               const config = statusConfig[job.status as keyof typeof statusConfig] || {
                 color: 'bg-slate-700 text-slate-200',
@@ -345,11 +360,11 @@ export default function ProcessingQueue({
                   <div className="flex items-start gap-4">
                     <input
                       type="checkbox"
-                      checked={selected.includes(job.id!)}
+                      checked={selectAllActive || selected.includes(job.id!)}
                       onChange={() => handleRowSelect(job.id!)}
                       className="w-4 h-4 mt-2 text-blue-600 bg-gray-700 border-gray-600 rounded focus:ring-blue-500 focus:ring-2 transition-all duration-200"
                       title="Select job"
-                      disabled={job.id === undefined || job.id === null}
+                      disabled={selectAllActive}
                     />
                     <div className="flex-1 space-y-2">
                       <h3 className="font-semibold text-white text-base">
@@ -363,7 +378,7 @@ export default function ProcessingQueue({
                         </Badge>
                       </div>
                       {job.status === 'processing' && (
-                        <Progress value={Math.random() * 80 + 10} className="h-2 mt-2 rounded-full bg-slate-700" />
+                        <Progress value={50} className="h-2 mt-2 rounded-full bg-slate-700" />
                       )}
                     </div>
                     {job.status === 'processing' && (
@@ -392,6 +407,38 @@ export default function ProcessingQueue({
               );
             })}
           </AnimatePresence>
+        )}
+
+        {/* Pagination Controls */}
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between pt-4 border-t border-slate-700">
+            <div className="text-sm text-slate-400">
+              Showing {startIndex + 1}-{Math.min(endIndex, filteredJobs.length)} of {filteredJobs.length} jobs
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentPage(Math.max(1, currentPage - 1))}
+                disabled={currentPage === 1}
+                className="text-slate-300 border-slate-600 hover:bg-slate-700"
+              >
+                Previous
+              </Button>
+              <span className="text-sm text-slate-300 px-3">
+                Page {currentPage} of {totalPages}
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setCurrentPage(Math.min(totalPages, currentPage + 1))}
+                disabled={currentPage === totalPages}
+                className="text-slate-300 border-slate-600 hover:bg-slate-700"
+              >
+                Next
+              </Button>
+            </div>
+          </div>
         )}
       </CardContent>
     </Card>

@@ -224,6 +224,12 @@ class ApiClient {
     const response = await api.get(url);
     return response.data;
   }
+
+  // Bulk delete processing jobs endpoint
+  async bulkDeleteProcessingJobs(payload) {
+    const response = await api.post('/processing/jobs/bulk-delete', payload);
+    return response.data;
+  }
 }
 
 export const apiClient = new ApiClient();

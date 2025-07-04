@@ -3,7 +3,8 @@ process.on('unhandledRejection', (reason, promise) => {
   console.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
-console.log('Processing API loaded');
+// Comment out noisy logging
+// console.log('Processing API loaded');
 // API routes for managing processing jobs including listing, updating, and status management.
 // Provides endpoints for processing job data retrieval and manipulation.
 
@@ -51,9 +52,69 @@ router.get('/jobs/ids', (req, res) => {
 router.get('/jobs', async (req, res) => {
   try {
     const queue = queues['episode-processing'];
-    // Get jobs from BullMQ/Redis (adjust job types and range as needed)
-    const jobs = await queue.getJobs(['active', 'waiting', 'completed', 'failed'], 0, 1000);
-    res.json({ jobs, total: jobs.length });
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 50; // Default 50 jobs per page
+    const offset = (page - 1) * limit;
+
+    // Get jobs from BullMQ/Redis with pagination (limit to avoid JSON size issues)
+    const jobs = await queue.getJobs(['active', 'waiting', 'completed', 'failed'], offset, offset + limit - 1);
+
+    // Get total count for pagination
+    const totalJobs = await queue.count();
+
+    // Map BullMQ statuses to frontend-expected statuses and extract only essential data
+    const mappedJobs = jobs.map((job) => {
+      // Extract only essential job data to reduce JSON size
+      const essentialJob = {
+        id: job.id,
+        status: job.status,
+        progress: job.progress || 0,
+        // Only include essential data fields
+        data: {
+          episodeFileId: job.data?.episodeFileId,
+          dbJobId: job.data?.dbJobId,
+          showId: job.data?.showId,
+          profileId: job.data?.profileId,
+        },
+        timestamp: job.timestamp,
+        processedOn: job.processedOn,
+        finishedOn: job.finishedOn,
+        failedReason: job.failedReason,
+        // Add computed fields for frontend compatibility
+        media_file_id: job.data?.episodeFileId,
+        dbJobId: job.data?.dbJobId,
+        created_date: new Date(job.timestamp).toISOString(),
+        updated_date: job.finishedOn ? new Date(job.finishedOn).toISOString() : new Date(job.timestamp).toISOString(),
+      };
+
+      // Map BullMQ statuses to frontend statuses
+      switch (job.status) {
+        case 'active':
+          essentialJob.status = 'processing';
+          break;
+        case 'waiting':
+          essentialJob.status = 'queued';
+          break;
+        case 'completed':
+          essentialJob.status = 'completed';
+          break;
+        case 'failed':
+          essentialJob.status = 'failed';
+          break;
+        default:
+          essentialJob.status = job.status;
+      }
+
+      return essentialJob;
+    });
+
+    res.json({
+      jobs: mappedJobs,
+      total: totalJobs,
+      page: page,
+      limit: limit,
+      totalPages: Math.ceil(totalJobs / limit),
+    });
   } catch (error) {
     console.error('Failed to fetch jobs from BullMQ:', error);
     res.status(500).json({ error: 'Failed to fetch jobs from BullMQ' });
@@ -138,11 +199,11 @@ router.delete('/jobs/:id', async (req, res) => {
     for (const file of tempFiles) {
       try {
         await fs.unlink(file);
-        logger.info({ file }, 'Deleted temp file on job deletion');
+        // logger.info({ file }, 'Deleted temp file on job deletion');
       } catch (err) {
         // Ignore if file does not exist
         if (err.code !== 'ENOENT') {
-          logger.warn({ file, error: err.message }, 'Failed to delete temp file on job deletion');
+          // logger.warn({ file, error: err.message }, 'Failed to delete temp file on job deletion');
         }
       }
     }
@@ -223,7 +284,7 @@ router.get('/debug/queue-state', (req, res) => {
 
   try {
     const debugState = debugQueueState();
-    logger.info('Queue debug state requested:', debugState);
+    // logger.info('Queue debug state requested:', debugState);
     res.json(debugState);
   } catch (error) {
     logger.error('Failed to get queue debug state:', error);
@@ -260,78 +321,83 @@ router.get('/media-files', async (req, res) => {
 
 // Bulk delete jobs endpoint
 router.post('/jobs/bulk-delete', async (req, res) => {
-  // console.log('--- BULK DELETE ROUTE HIT ---', new Date().toISOString());
   try {
     const db = req.app.get('db');
     const logger = req.app.get('logger');
-    const { jobIds, all } = req.body;
-    logger.info('Bulk delete request body:', { jobIds, all });
+    const { jobIds, all, filter } = req.body;
+    // logger.info('Bulk delete request body:', { jobIds, all, filter });
     let deletedCount = 0;
     const failed = [];
 
     // Pause all workers first to prevent new jobs from starting
-    logger.info('Pausing all workers before bulk delete');
+    // logger.info('Pausing all workers before bulk delete');
     await pauseAllWorkers();
 
-    if (all) {
-      logger.info('Fetching all jobs for cleanup before DB delete');
-      // Fetch all jobs with full details before deleting from DB
-      const jobs = getProcessingJobs(db, { limit: 10000 });
-      logger.info('Starting DB delete for all jobs');
-      try {
-        db.prepare('DELETE FROM processing_jobs').run();
-        logger.info('All jobs deleted from DB');
-      } catch (dbErr) {
-        logger.error('DB error during bulk delete:', dbErr, typeof dbErr, JSON.stringify(dbErr));
-        throw dbErr;
+    // If 'all' and a filter is provided, delete all jobs matching the filter
+    if (all && filter && filter.status) {
+      // logger.info('Fetching all jobs matching filter for bulk delete:', filter);
+      // Build SQL for filter
+      let sql = 'SELECT id FROM processing_jobs WHERE 1=1';
+      const params = [];
+      if (filter.status) {
+        sql += ' AND status = ?';
+        params.push(filter.status);
       }
-      logger.info('Starting BullMQ and temp file cleanup for all jobs');
-      for (const job of jobs) {
+      // Add more filter fields as needed
+      const rows = db.prepare(sql).all(...params);
+      const idsToDelete = rows.map((row) => row.id);
+      // logger.info('Found jobs to delete:', idsToDelete.length);
+      if (idsToDelete.length === 0) {
+        await resumeAllWorkers();
+        return res.json({ success: true, deletedCount: 0, failed: [] });
+      }
+      // Delete jobs in DB
+      db.prepare(`DELETE FROM processing_jobs WHERE id IN (${idsToDelete.map(() => '?').join(',')})`).run(...idsToDelete);
+      deletedCount = idsToDelete.length;
+      // Remove from BullMQ and clean temp files
+      for (const jobId of idsToDelete) {
         try {
-          await removeJobFromAllQueues(job.id);
-          // Clean up temp files (audio and trimmed)
-          const tempFiles = [];
-          if (job.file_path) {
-            const audioFileName = path.basename(job.file_path, path.extname(job.file_path)) + '.wav';
-            const audioPath = path.join(config.tempDir, 'audio', audioFileName);
-            tempFiles.push(audioPath);
-            tempFiles.push(
-              path.join(config.tempDir, 'trimmed', `intro_${job.id}.mp4`),
-              path.join(config.tempDir, 'trimmed', `credits_${job.id}.mp4`),
-            );
-          }
-          for (const file of tempFiles) {
-            try {
-              await fs.unlink(file);
-              // logger.info({ file }, 'Deleted temp file on bulk job deletion');
-            } catch (err) {
-              if (err.code !== 'ENOENT') {
-                logger.warn({ file, error: err.message }, 'Failed to delete temp file on bulk job deletion');
-              }
-            }
-          }
+          await removeJobFromAllQueues(jobId);
         } catch (err) {
-          failed.push(job.id);
+          failed.push(jobId);
         }
       }
-      logger.info('Bulk delete all jobs complete');
-      // Resume all workers
-      logger.info('Resuming all workers after bulk delete');
+      // logger.info('Bulk delete for filter complete');
       await resumeAllWorkers();
-      return res.json({ success: true, all: true, deletedCount: jobs.length, failed });
+      return res.json({ success: true, deletedCount, failed });
+    }
+
+    // Existing logic for all jobs
+    if (all) {
+      let allJobIds = [];
+      for (const queue of Object.values(queues)) {
+        const jobs = await queue.getJobs(['waiting', 'active', 'delayed', 'paused', 'completed', 'failed']);
+        allJobIds.push(...jobs.map((job) => job.id));
+      }
+      allJobIds = [...new Set(allJobIds)];
+      deletedCount = 0;
+      for (const jobId of allJobIds) {
+        try {
+          await removeJobFromAllQueues(jobId);
+          deletedCount++;
+        } catch (err) {
+          failed.push(jobId);
+        }
+      }
+      db.prepare('DELETE FROM processing_jobs').run();
+      await resumeAllWorkers();
+      return res.json({ success: true, all: true, deletedCount, failed });
     }
     if (!Array.isArray(jobIds) || jobIds.length === 0) {
-      logger.warn('No job IDs provided for bulk delete');
-      // Resume workers even if no jobs to delete
+      // logger.warn('No job IDs provided for bulk delete');
       await resumeAllWorkers();
       return res.status(400).json({ error: 'No job IDs provided' });
     }
-    logger.info('Fetching selected jobs for cleanup before DB delete');
+    // logger.info('Fetching selected jobs for cleanup before DB delete');
     // Fetch full job objects before deleting from DB
     const toDelete = jobIds.map((id) => parseInt(id)).filter((id) => !isNaN(id));
     if (toDelete.length === 0) {
-      logger.warn('No valid job IDs to delete');
-      // Resume workers even if no valid jobs to delete
+      // logger.warn('No valid job IDs to delete');
       await resumeAllWorkers();
       return res.status(400).json({ error: 'No valid job IDs to delete' });
     }
@@ -340,13 +406,12 @@ router.post('/jobs/bulk-delete', async (req, res) => {
       jobs = db.prepare(`SELECT pj.*, ef.file_path FROM processing_jobs pj JOIN episode_files ef ON pj.media_file_id = ef.id WHERE pj.id IN (${toDelete.map(() => '?').join(',')})`).all(...toDelete);
       db.prepare(`DELETE FROM processing_jobs WHERE id IN (${toDelete.map(() => '?').join(',')})`).run(...toDelete);
     } catch (dbErr) {
-      logger.error('DB error during selected jobs bulk delete:', dbErr, 'SQL:', `SELECT id FROM processing_jobs WHERE id IN (${toDelete.map(() => '?').join(',')})`, 'Params:', toDelete);
-      // Resume workers even if DB error
+      // logger.error('DB error during selected jobs bulk delete:', dbErr, 'SQL:', `SELECT id FROM processing_jobs WHERE id IN (${toDelete.map(() => '?').join(',')})`, 'Params:', toDelete);
       await resumeAllWorkers();
       throw dbErr;
     }
     deletedCount = jobs.length;
-    logger.info('DB delete for selected jobs complete');
+    // logger.info('DB delete for selected jobs complete');
     // Remove from BullMQ and clean temp files
     for (const job of jobs) {
       try {
@@ -365,10 +430,9 @@ router.post('/jobs/bulk-delete', async (req, res) => {
         for (const file of tempFiles) {
           try {
             await fs.unlink(file);
-            // logger.info({ file }, 'Deleted temp file on bulk job deletion');
           } catch (err) {
             if (err.code !== 'ENOENT') {
-              logger.warn({ file, error: err.message }, 'Failed to delete temp file on bulk job deletion');
+              // logger.warn({ file, error: err.message }, 'Failed to delete temp file on bulk job deletion');
             }
           }
         }
@@ -376,14 +440,11 @@ router.post('/jobs/bulk-delete', async (req, res) => {
         failed.push(job.id);
       }
     }
-    logger.info('Bulk delete for selected jobs complete');
-    // Resume all workers
-    logger.info('Resuming all workers after bulk delete');
+    // logger.info('Bulk delete for selected jobs complete');
     await resumeAllWorkers();
     res.json({ success: true, deletedCount, failed });
   } catch (err) {
     console.error('UNHANDLED ERROR in /jobs/bulk-delete:', err && (err.stack || err.message || err));
-    // Resume workers even if error
     try {
       await resumeAllWorkers();
     } catch (resumeErr) {
@@ -403,9 +464,9 @@ router.post('/cleanup-temp-files', (req, res) => {
     try {
       const files = await fs.readdir(dir);
       await Promise.all(files.map((file) => fs.unlink(path.join(dir, file)).catch(() => {})));
-      logger.info({ dir, count: files.length }, 'Temp files cleaned up');
+      // logger.info({ dir, count: files.length }, 'Temp files cleaned up');
     } catch (err) {
-      logger.warn({ dir, error: err.message }, 'Failed to clean temp files');
+      // logger.warn({ dir, error: err.message }, 'Failed to clean temp files');
     }
   }
 
